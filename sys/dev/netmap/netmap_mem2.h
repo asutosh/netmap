@@ -1,5 +1,10 @@
-/*
- * Copyright (C) 2012-2014 Matteo Landi, Luigi Rizzo, Giuseppe Lettieri. All rights reserved.
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
+ * Copyright (C) 2012-2014 Matteo Landi
+ * Copyright (C) 2012-2016 Luigi Rizzo
+ * Copyright (C) 2012-2016 Giuseppe Lettieri
+ * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -24,7 +29,7 @@
  */
 
 /*
- * $FreeBSD: head/sys/dev/netmap/netmap_mem2.c 234290 2012-04-14 16:44:18Z luigi $
+ * $FreeBSD$
  *
  * (New) memory allocator for netmap
  */
@@ -52,7 +57,7 @@
  * of the object, and from there locate the offset from the beginning
  * of the region.
  *
- * The invididual allocators manage a pool of memory for objects of
+ * The individual allocators manage a pool of memory for objects of
  * the same size.
  * The pool is split into smaller clusters, whose size is a
  * multiple of the page size. The cluster size is chosen
@@ -65,7 +70,7 @@
  * Allocation scans the bitmap; this is done only on attach, so we are not
  * too worried about performance
  *
- * For each allocator we can define (thorugh sysctl) the size and
+ * For each allocator we can define (through sysctl) the size and
  * number of each object. Memory is allocated at the first use of a
  * netmap file descriptor, and can be freed when all such descriptors
  * have been released (including unmapping the memory).
@@ -116,8 +121,10 @@
  */
 
 extern struct netmap_mem_d nm_mem;
+typedef uint16_t nm_memid_t;
 
 int	   netmap_mem_get_lut(struct netmap_mem_d *, struct netmap_lut *);
+nm_memid_t netmap_mem_get_id(struct netmap_mem_d *);
 vm_paddr_t netmap_mem_ofstophys(struct netmap_mem_d *, vm_ooffset_t);
 #ifdef _WIN32
 PMDL win32_build_user_vm_map(struct netmap_mem_d* nmd);
@@ -125,52 +132,58 @@ PMDL win32_build_user_vm_map(struct netmap_mem_d* nmd);
 int	   netmap_mem_finalize(struct netmap_mem_d *, struct netmap_adapter *);
 int 	   netmap_mem_init(void);
 void 	   netmap_mem_fini(void);
-struct netmap_if * netmap_mem_if_new(struct netmap_adapter *);
+struct netmap_if * netmap_mem_if_new(struct netmap_adapter *, struct netmap_priv_d *);
 void 	   netmap_mem_if_delete(struct netmap_adapter *, struct netmap_if *);
 int	   netmap_mem_rings_create(struct netmap_adapter *);
 void	   netmap_mem_rings_delete(struct netmap_adapter *);
-void 	   netmap_mem_deref(struct netmap_mem_d *, struct netmap_adapter *);
-int	netmap_mem2_get_pool_info(struct netmap_mem_d *, u_int, u_int *, u_int *);
-int	   netmap_mem_get_info(struct netmap_mem_d *, u_int *size, u_int *memflags, uint16_t *id);
+int 	   netmap_mem_deref(struct netmap_mem_d *, struct netmap_adapter *);
+int	   netmap_mem2_get_pool_info(struct netmap_mem_d *, u_int, u_int *, u_int *);
+int	   netmap_mem_get_info(struct netmap_mem_d *, uint64_t *size,
+				u_int *memflags, nm_memid_t *id);
 ssize_t    netmap_mem_if_offset(struct netmap_mem_d *, const void *vaddr);
-struct netmap_mem_d* netmap_mem_private_new(const char *name,
-	u_int txr, u_int txd, u_int rxr, u_int rxd, u_int extra_bufs, u_int npipes,
-	int* error);
-void	   netmap_mem_delete(struct netmap_mem_d *);
+struct netmap_mem_d* netmap_mem_private_new( u_int txr, u_int txd, u_int rxr, u_int rxd,
+		u_int extra_bufs, u_int npipes, int* error);
 
-//#define NM_DEBUG_MEM_PUTGET 1
-
-#ifdef NM_DEBUG_MEM_PUTGET
-
-#define netmap_mem_get(nmd) 				\
-	do {						\
-		__netmap_mem_get(nmd, __FUNCTION__, __LINE__);	\
-	} while (0)
-
-#define netmap_mem_put(nmd)				\
-	do {						\
-		__netmap_mem_put(nmd, __FUNCTION__, __LINE__);	\
-	} while (0)
-
-void __netmap_mem_get(struct netmap_mem_d *, const char *, int);
+#define netmap_mem_get(d) __netmap_mem_get(d, __FUNCTION__, __LINE__)
+#define netmap_mem_put(d) __netmap_mem_put(d, __FUNCTION__, __LINE__)
+struct netmap_mem_d* __netmap_mem_get(struct netmap_mem_d *, const char *, int);
+struct netmap_mem_d* netmap_mem_get_iommu(struct netmap_adapter *);
 void __netmap_mem_put(struct netmap_mem_d *, const char *, int);
-#else /* !NM_DEBUG_MEM_PUTGET */
+struct netmap_mem_d* netmap_mem_find(nm_memid_t);
+unsigned netmap_mem_bufsize(struct netmap_mem_d *nmd);
 
-void netmap_mem_get(struct netmap_mem_d *);
-void netmap_mem_put(struct netmap_mem_d *);
+#ifdef WITH_EXTMEM
+struct netmap_mem_d* netmap_mem_ext_create(uint64_t, struct nmreq_pools_info *, int *);
+#else /* !WITH_EXTMEM */
+#define netmap_mem_ext_create(nmr, _perr) \
+	({ int *perr = _perr; if (perr) *(perr) = EOPNOTSUPP; NULL; })
+#endif /* WITH_EXTMEM */
 
-#endif /* !NM_DEBUG_PUTGET */
-
-#ifdef WITH_PTNETMAP_GUEST
+#ifdef WITH_PTNETMAP
 struct netmap_mem_d* netmap_mem_pt_guest_new(struct ifnet *,
-		struct netmap_pt_guest_ops *);
+					     unsigned int nifp_offset,
+					     unsigned int memid);
 struct ptnetmap_memdev;
 struct netmap_mem_d* netmap_mem_pt_guest_attach(struct ptnetmap_memdev *, uint16_t);
-#endif /* WITH_PTNETMAP_GUEST */
+int netmap_mem_pt_guest_ifp_del(struct netmap_mem_d *, struct ifnet *);
+#endif /* WITH_PTNETMAP */
+
+int netmap_mem_pools_info_get(struct nmreq_pools_info *,
+				struct netmap_mem_d *);
 
 #define NETMAP_MEM_PRIVATE	0x2	/* allocator uses private address space */
 #define NETMAP_MEM_IO		0x4	/* the underlying memory is mmapped I/O */
 
 uint32_t netmap_extra_alloc(struct netmap_adapter *, uint32_t *, uint32_t n);
+
+#ifdef WITH_EXTMEM
+#include <net/netmap_virt.h>
+struct nm_os_extmem; /* opaque */
+struct nm_os_extmem *nm_os_extmem_create(unsigned long, struct nmreq_pools_info *, int *perror);
+char *nm_os_extmem_nextpage(struct nm_os_extmem *);
+int nm_os_extmem_nr_pages(struct nm_os_extmem *);
+int nm_os_extmem_isequal(struct nm_os_extmem *, struct nm_os_extmem *);
+void nm_os_extmem_delete(struct nm_os_extmem *);
+#endif /* WITH_EXTMEM */
 
 #endif

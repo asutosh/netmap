@@ -198,7 +198,6 @@ re_netmap_rxsync(struct netmap_kring *kring, int flags)
 	 * is to stop right before nm_hwcur.
 	 */
 	if (netmap_no_pendintr || force_update) {
-		uint16_t slot_flags = kring->nkr_slot_flags;
 		uint32_t stop_i = nm_prev(kring->nr_hwcur, lim);
 
 		nic_i = sc->cur_rx; /* next pkt to check */
@@ -215,7 +214,7 @@ re_netmap_rxsync(struct netmap_kring *kring, int flags)
 			/* XXX subtract crc */
 			total_len = (total_len < 4) ? 0 : total_len - 4;
 			ring->slot[nm_i].len = total_len;
-			ring->slot[nm_i].flags = slot_flags;
+			ring->slot[nm_i].flags = 0;
 			// ifp->stats.rx_packets++;
 			nm_i = nm_next(nm_i, lim);
 			nic_i = nm_next(nic_i, lim);
@@ -279,13 +278,13 @@ re_netmap_tx_init(struct SOFTC_T *sc)
 	int i, l;
 	uint64_t paddr;
 
-        slot = netmap_reset(na, NR_TX, 0, 0);
+	slot = netmap_reset(na, NR_TX, 0, 0);
 	if (!slot)
 		return 0;	// not in native netmap mode
 
 	/* l points in the netmap ring, i points in the NIC ring */
 	for (i = 0; i < na->num_tx_desc; i++) {
-		l = netmap_idx_n2k(&na->tx_rings[0], i);
+		l = netmap_idx_n2k(na->tx_rings[0], i);
 		PNMB(na, slot + l, &paddr);
 		desc[i].addr = htole64(paddr);
 	}
@@ -303,7 +302,7 @@ re_netmap_rx_init(struct SOFTC_T *sc)
 	int i, lim, l;
 	uint64_t paddr;
 
-        slot = netmap_reset(na, NR_RX, 0, 0);
+	slot = netmap_reset(na, NR_RX, 0, 0);
 	if (!slot)
 		return 0;  // not in native netmap mode
 	/*
@@ -312,8 +311,8 @@ re_netmap_rx_init(struct SOFTC_T *sc)
 	 * XXX do we need -1 instead ?
 	 */
 	lim = na->num_rx_desc /* - 1 */ - nm_kr_rxspace(&na->rx_rings[0]);
-	for (i = 0; i < na->num_rx_desc; i++) {
-		l = netmap_idx_n2k(&na->rx_rings[0], i);
+	for (i = 0; i < lim; i++) {
+		l = netmap_idx_n2k(na->rx_rings[0], i);
 		PNMB(na, slot + l, &paddr);
 		cmdstat = NETMAP_BUF_SIZE(na);
 		if (i == na->num_rx_desc - 1)

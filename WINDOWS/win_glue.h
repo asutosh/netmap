@@ -22,9 +22,9 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
- 
-#ifndef _WIN_GLUE_H_
-#define _WIN_GLUE_H_
+
+#ifndef NETMAP_WIN_GLUE_H
+#define NETMAP_WIN_GLUE_H
 
 /*
  * This header is used to compile the kernel components of netmap for Windows.
@@ -46,7 +46,7 @@
 #pragma warning(disable:4118)	//error in between signed and unsigned
 //#pragma warning(disable:4115)	//definition of type between parenthesis
 #pragma warning(disable:4127)	//constant conditional expression
-#pragma warning(disable:4133)	//warning: uncompatible types: From <1> to <2>
+#pragma warning(disable:4133)	//warning: incompatible types: From <1> to <2>
 #pragma warning(disable:4142)	//benign type redefinition
 // #pragma warning(disable:4189)	//local variable initialized but without references
 #pragma warning(disable:4200)	//non-standard extension: matrix of zero dimension in struct/union
@@ -54,8 +54,8 @@
 #pragma warning(disable:4229)	// zero-size arrays // XXX
 #pragma warning(disable:4242)	//possible loss of data in conversion
 #pragma warning(disable:4244)	//possible loss of data in conversion
-#pragma warning(disable:4245)	//conversion from int to uint_32t: corrispondence error between signed and unsigned
-#pragma warning(disable:4389)	//wrong corrispondence between signed and unsigned
+#pragma warning(disable:4245)	//conversion from int to uint_32t: correspondence error between signed and unsigned
+#pragma warning(disable:4389)	//wrong correspondence between signed and unsigned
 
 #pragma warning(disable:4267)	//conversion from 'size_t' to <type>. possible loss of data
 
@@ -102,6 +102,10 @@ typedef unsigned __int64	uint64_t;
 typedef uint32_t		u_int;
 typedef ULONG			u_long;
 typedef SSIZE_T			ssize_t;
+typedef int                     bool;
+
+#define true    1
+#define false   0
 
 
 struct timeval {
@@ -113,7 +117,7 @@ typedef char *			caddr_t;
 
 typedef PHYSICAL_ADDRESS 	vm_paddr_t;
 typedef uint32_t		vm_offset_t;
-typedef ULONG 			vm_ooffset_t; 
+typedef ULONG 			vm_ooffset_t;
 
 #define thread PIO_STACK_LOCATION
 
@@ -123,7 +127,7 @@ typedef ULONG 			vm_ooffset_t;
 /*
  *	ERRNO -> NTSTATUS TRANSLATION
  */
-#define ENOBUFS		STATUS_DEVICE_INSUFFICIENT_RESOURCES	
+#define ENOBUFS		STATUS_DEVICE_INSUFFICIENT_RESOURCES
 #define EOPNOTSUPP	STATUS_INVALID_DEVICE_REQUEST
 
 /*
@@ -131,7 +135,7 @@ typedef ULONG 			vm_ooffset_t;
  */
 #define destroy_dev(a)
 #define __user
-#define nm_iommu_group_id(dev)	0
+#define nm_iommu_group_id(dev)	-1
 
 
 /*
@@ -199,7 +203,6 @@ static inline void mtx_unlock(win_spinlock_t *m)
 #define BDG_RTRYLOCK(b)			ExAcquireResourceExclusiveLite(&b->bdg_lock, FALSE)
 #define BDG_SET_VAR(lval, p)		((lval) = (p))
 #define BDG_GET_VAR(lval)		(lval)
-#define BDG_FREE(p)			free(p)
 
 
 /*
@@ -212,16 +215,17 @@ typedef struct _win_SELINFO
 	KGUARDED_MUTEX mutex;
 } win_SELINFO;
 
-static void 
-win_initialize_waitqueue(win_SELINFO* queue)
+static int
+nm_os_selinfo_init(win_SELINFO* queue, const char *name)
 {
 	KeInitializeEvent(&queue->queue, NotificationEvent, TRUE);
 	KeInitializeGuardedMutex(&queue->mutex);
+	return 0;
 }
 
+static void nm_os_selinfo_uninit(win_SELINFO *queue) { /* XXX nothing to do here? */ }
+
 #define PI_NET					16
-#define init_waitqueue_head(x)			win_initialize_waitqueue(x);
-#define netmap_knlist_destroy(x)
 #define tsleep(ident, priority, wmesg, time)	KeDelayExecutionThread(KernelMode, FALSE, (PLARGE_INTEGER)time)	
 
 
@@ -253,6 +257,7 @@ static int time_uptime_w32()
  * Is it ok to use RtlCopyMemory for user buffers ?
  */
 #define copyin(src, dst, copy_len)		RtlCopyMemory(dst, src, copy_len)
+#define copyout(src, dst, copy_len)		RtlCopyMemory(dst, src, copy_len)
 
 
 /*
@@ -262,7 +267,7 @@ static int time_uptime_w32()
 struct netmap_adapter;
 
 struct net_device {
-	char	if_xname[IFNAMSIZ];			// external name (name + unit) 
+	char	if_xname[IFNAMSIZ];			// external name (name + unit)
 	//        struct ifaltq if_snd;         /* output queue (includes altq) */
 	struct netmap_adapter	*na;
 	void	*pfilter;
@@ -302,9 +307,14 @@ typedef struct _FUNCTION_POINTER_XCHANGE {
 } FUNCTION_POINTER_XCHANGE; // , *PFUNCTION_POINTER_XCHANGE;
 
 //XXX_ale To be correctly redefined
-#define GET_MBUF_REFCNT(a)				1
+#define MBUF_REFCNT(a)				1
 #define	SET_MBUF_DESTRUCTOR(a,b)		a->netmap_default_mbuf_destructor = b;// XXX must be set to enable tx notifications
-#define MBUF_IFP(m)						m->dev	
+#define MBUF_QUEUED(m)				1
+#define GEN_TX_MBUF_IFP(m)			m->dev
+#define MBUF_LEN(m)				((m)->m_len)
+#define MBUF_TXQ(m)                             0
+
+int MBUF_TRANSMIT(struct netmap_adapter *na, struct ifnet *ifp, struct mbuf *m);
 
 void win32_init_lookaside_buffers(struct net_device *ifp);
 void win32_clear_lookaside_buffers(struct net_device *ifp);
@@ -317,52 +327,6 @@ struct device;	// XXX unused, in some place in netmap_mem2.c
 
 #define bcopy(_s, _d, _l)			RtlCopyMemory(_d, _s, _l)
 #define bzero(addr, size)			RtlZeroMemory(addr, size)
-#define malloc(size, _ty, flags)		win_kernel_malloc(size, _ty, flags)
-#define free(addr, _type)			ExFreePoolWithTag(addr, _type)
-#define realloc(src, len, old_len)		win_reallocate(src, len, old_len)
-
-/*
- * we default to always allocating and zeroing
- */
-static void *
-win_kernel_malloc(size_t size, int32_t ty, int flags)
-{
-	void* mem = ExAllocatePoolWithTag(NonPagedPool, size, ty);
-
-	(void)flags;
-
-	if (mem != NULL) { // && flags & M_ZERO XXX todo
-		RtlZeroMemory(mem, size);
-	}
-	return mem;
-}
-
-static inline PVOID
-win_reallocate(void* src, size_t size, size_t oldSize)
-{
-	//DbgPrint("Netmap.sys: win_reallocate(%p, %i, %i)", src, size, oldSize);
-	PVOID newBuff = NULL; /* default return value */
-
-	if (src == NULL) { /* if size > 0, this is a malloc */
-		if (size > 0) {
-			newBuff = malloc(size, M_DEVBUF, M_NOWAIT | M_ZERO);
-		}
-	} else if (size == 0) {
-		free(src, M_DEVBUF);
-	} else if (size == oldSize) {
-		newBuff = src;
-	} else { /* realloc -- XXX later maybe ignore shrink ? */
-		newBuff = malloc(size, M_DEVBUF, M_NOWAIT | M_ZERO);
-		if (newBuff != NULL) {
-			if (size <= oldSize) { /* shrink, just copy back part of the data */
-				RtlCopyMemory(newBuff, src, size);
-			} else {
-				RtlCopyMemory(newBuff, src, oldSize);
-			}
-		}
-	}
-	return newBuff;
-}
 
 struct mbuf *win_make_mbuf(struct net_device *, uint32_t, const char *);
 
@@ -370,7 +334,7 @@ struct mbuf *win_make_mbuf(struct net_device *, uint32_t, const char *);
 	// XXX do we also need the netmap_default_mbuf_destructor ?
 
 
-static inline void 
+static inline void
 win32_ndis_packet_freem(struct mbuf* m)
 {
 	if (m != NULL) {
@@ -382,10 +346,9 @@ win32_ndis_packet_freem(struct mbuf* m)
 		ExFreeToNPagedLookasideList(&m->dev->mbuf_pool, m);
 		//free(m, M_DEVBUF);
 
-	}	
+	}
 }
 
-#define MBUF_LEN(m)					((m)->m_len)
 /*
  * m_devget() is used to construct an mbuf from a host ring to the host stack
  */
@@ -398,6 +361,7 @@ win32_ndis_packet_freem(struct mbuf* m)
 
 struct net_device* ifunit_ref(const char *name);
 void if_rele(struct net_device *ifp);
+void if_ref(struct net_device *ifp);
 
 PVOID send_up_to_stack(struct ifnet *ifp, struct mbuf *m, PVOID head);
 
@@ -630,4 +594,4 @@ int sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size
 #endif
 
 
-#endif /* _WIN_GLUE_H */
+#endif /* NETMAP_WIN_GLUE_H */

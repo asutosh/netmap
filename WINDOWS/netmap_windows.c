@@ -85,22 +85,22 @@ ioctlCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     NMG_LOCK();
     priv = irpSp->FileObject->FsContext;
     if (priv == NULL) {
-	priv = malloc(sizeof (*priv), M_DEVBUF, M_NOWAIT | M_ZERO); // could wait
+	priv = nm_os_malloc(sizeof (*priv)); // could wait
 	if (priv == NULL) {
 	    status = STATUS_INSUFFICIENT_RESOURCES;
 	} else {
 	    priv->np_refs = 1;
-	    D("Netmap.sys: ioctlCreate::priv->np_refcount = %i", priv->np_refs);
+	    nm_prinf("Netmap.sys: ioctlCreate::priv->np_refcount = %i", priv->np_refs);
 	    irpSp->FileObject->FsContext = priv;
 	}
     } else {
 	priv->np_refs += 1;
-	D("Netmap.sys: ioctlCreate::priv->np_refcount = %i", priv->np_refs);
+	nm_prinf("Netmap.sys: ioctlCreate::priv->np_refcount = %i", priv->np_refs);
     }
     NMG_UNLOCK();
 
     //--------------------------------------------------------
-    //D("Netmap.sys: Pid %i attached: memory allocated @%p", currentProcId, priv);
+    //nm_prinf("Netmap.sys: Pid %i attached: memory allocated @%p", currentProcId, priv);
 
     Irp->IoStatus.Status = status;
     IoCompleteRequest( Irp, IO_NO_INCREMENT );
@@ -218,8 +218,15 @@ windows_handle_rx(struct net_device *ifp, uint32_t length, const char *data)
 {
 	struct mbuf *m = win_make_mbuf(ifp, length, data);
 
-	if (m)
-		generic_rx_handler(ifp, m);
+	if (m) {
+		int stolen = generic_rx_handler(ifp, m);
+
+		if (!stolen) {
+			m_freem(m);
+			/* XXX Should we return m instead of freeing it? */
+		}
+	}
+
 	return NULL;
 }
 
@@ -237,6 +244,53 @@ windows_handle_tx(struct net_device *ifp, uint32_t length, const char *data)
 	return NULL;
 }
 
+/*
+ * we default to always allocating and zeroing
+ */
+void *
+nm_os_malloc(size_t size)
+{
+    void* mem = ExAllocatePoolWithTag(NonPagedPool, size, /* M_DEVBUF */ 2);
+
+    if (mem != NULL) {
+        RtlZeroMemory(mem, size);
+    }
+    return mem;
+}
+
+void
+nm_os_free(void *addr)
+{
+    ExFreePoolWithTag(addr, /* M_DEVBUF */ 2);
+}
+
+void *
+nm_os_realloc(void *src, size_t size, size_t oldSize)
+{
+    //DbgPrint("Netmap.sys: win_reallocate(%p, %i, %i)", src, size, oldSize);
+    PVOID newBuff = NULL; /* default return value */
+
+    if (src == NULL) { /* if size > 0, this is a malloc */
+        if (size > 0) {
+            newBuff = nm_os_malloc(size);
+        }
+    } else if (size == 0) {
+        nm_os_free(src);
+    } else if (size == oldSize) {
+        newBuff = src;
+    } else { /* realloc -- XXX later maybe ignore shrink ? */
+        newBuff = nm_os_malloc(size);
+        if (newBuff != NULL) {
+            if (size <= oldSize) { /* shrink, just copy back part of the data */
+                RtlCopyMemory(newBuff, src, size);
+            } else {
+                RtlCopyMemory(newBuff, src, oldSize);
+            }
+        }
+    }
+    return newBuff;
+}
+
 int
 nm_os_catch_rx(struct netmap_generic_adapter *gna, int intercept)
 {
@@ -251,15 +305,17 @@ nm_os_catch_rx(struct netmap_generic_adapter *gna, int intercept)
 }
 
 
-void
-nm_os_catch_tx(struct netmap_generic_adapter *gna, int enable)
+int
+nm_os_catch_tx(struct netmap_generic_adapter *gna, int intercept)
 {
     struct netmap_adapter *na = &gna->up.up;
     int *p = na->ifp->intercept;
 
     if (p != NULL) {
-	*p = enable ? (*p | NM_WIN_CATCH_TX) : (*p & ~NM_WIN_CATCH_TX);
+	*p = intercept ? (*p | NM_WIN_CATCH_TX) : (*p & ~NM_WIN_CATCH_TX);
     }
+
+    return 0;
 }
 
 /*
@@ -289,6 +345,18 @@ nm_os_send_up(struct ifnet *ifp, struct mbuf *m, struct mbuf *prev)
 	return head;
 }
 
+int
+MBUF_TRANSMIT(struct netmap_adapter *na, struct ifnet *ifp, struct mbuf *m)
+{
+	if (ndis_hooks.injectPacket == NULL) {
+		return 0;
+	}
+	if (ndis_hooks.injectPacket(ifp->pfilter, NULL, 0, TRUE, m)) {
+                return 0;
+        }
+        return -1;
+}
+
 /*
  * Transmit routine used by generic_netmap_txsync(). Returns 0 on success
  * and <> 0 on error (which may be packet drops or other errors).
@@ -306,11 +374,11 @@ nm_os_generic_xmit_frame(struct nm_os_gen_arg *a)
 		a->tail = cur;
 		if (a->head == NULL)
 			a->head = cur;
+		return 0;
 	}
-	else {
-		return NDIS_STATUS_BUFFER_OVERFLOW;
-	}
-	return  0;
+
+	/* NDIS_STATUS_BUFFER_OVERFLOW */
+	return -1;
 }
 
 /*
@@ -331,6 +399,14 @@ nm_os_generic_find_num_queues(struct ifnet *ifp, u_int *txq, u_int *rxq)
     //XXX_ale: for a generic device is enough? need to find where this info is
     *txq = 1;
     *rxq = 1;
+}
+
+void
+nm_os_generic_set_features(struct netmap_generic_adapter *gna)
+{
+	/* No support for now. */
+	gna->rxsg = 0;
+	gna->txqdisc = 0;
 }
 //
 
@@ -489,7 +565,7 @@ ioctlDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 		}
 
 		ret = netmap_ioctl(priv, irpSp->Parameters.DeviceIoControl.IoControlCode,
-			(caddr_t)&arg, NULL);
+			(caddr_t)&arg, NULL, 1);
 		if (NT_SUCCESS(ret)) {
 			if (data && !NT_SUCCESS(copy_to_user((void*)data, &arg, argsize, Irp))) {
 				DbgPrint("Netmap.sys: ioctl failure/cannot copy data to user");
@@ -535,7 +611,7 @@ ifunit_ref(const char* name)
     struct net_device *	ifp = NULL;
 
     if (strlen(name) < 4 || _strnicmp(name, "eth", 3) != 0) {
-	D("not a NIC");
+	nm_prerr("not a NIC");
 	return NULL;
     }
 	if (ndis_hooks.ndis_regif == NULL)
@@ -544,7 +620,7 @@ ifunit_ref(const char* name)
     deviceIfIndex = getDeviceIfIndex(name+3);
     if (deviceIfIndex < 0)
 	return NULL;
-    ifp = malloc(sizeof(struct net_device), M_DEVBUF, M_NOWAIT | M_ZERO);
+    ifp = nm_os_malloc(sizeof(struct net_device));
     if (ifp == NULL)
 	return NULL;
 
@@ -556,7 +632,7 @@ ifunit_ref(const char* name)
 	win32_init_lookaside_buffers(ifp);
 
 	if (ndis_hooks.ndis_regif(ifp) != STATUS_SUCCESS) {
-	free(ifp, M_DEVBUF);
+	nm_os_free(ifp);
 	win32_clear_lookaside_buffers(ifp);
 	return NULL; /* not found */
     }
@@ -618,19 +694,19 @@ windows_netmap_mmap(PIRP Irp)
 	priv = irpSp->FileObject->FsContext;
 
 	if (priv == NULL) {
-		D("no priv");
+		nm_prerr("no priv");
 		return STATUS_DEVICE_DATA_ERROR;
 	}
 	na = priv->np_na;
 	if (na == NULL) {
-		D("na not attached");
+		nm_prerr("na not attached");
 		return STATUS_DEVICE_DATA_ERROR;
 	}
 	mb(); /* XXX really ? */
 
 	mdl = win32_build_user_vm_map(na->nm_mem);
 	if (mdl == NULL) {
-		D("failed building memory map");
+		nm_prerr("failed building memory map");
 		return STATUS_DEVICE_DATA_ERROR;
 	}
 
@@ -803,10 +879,20 @@ nm_os_vi_persist(const char *name, struct ifnet **ret)
 void
 bdg_mismatch_datapath(struct netmap_vp_adapter *na,
 	struct netmap_vp_adapter *dst_na,
-	struct nm_bdg_fwd *ft_p, struct netmap_ring *ring,
+	const struct nm_bdg_fwd *ft_p, struct netmap_ring *dst_ring,
 	u_int *j, u_int lim, u_int *howmany)
 {
     DbgPrint("bdg_mismatch_datapath unimplemented!!!\n");
+}
+
+void if_ref(struct net_device *ifp)
+{
+	/*
+	* XXX This is just to shut up the compiler.
+	* I wouldn't know what to out in here yet...
+	*/
+	DbgPrint("unimplemented if_ref!!!\n");
+/* 	dev_hold(ifp); */
 }
 
 void
@@ -841,6 +927,12 @@ nm_os_ifnet_fini(void)
 
 }
 
+unsigned
+nm_os_ifnet_mtu(struct ifnet *ifp)
+{
+       return 1500; /* XXX hardwired */
+}
+
 /*
  * Mitigation support
  */
@@ -848,7 +940,7 @@ nm_os_ifnet_fini(void)
 void
 generic_timer_handler(struct hrtimer *t)
 {
-	DbgPrint("unimplemented generic_timer_handler %p\n", t);
+	DbgPrint("unimplemented generic_timer_handler\n", t);
 #if 0
 	struct nm_generic_mit *mit =
 		container_of(t, struct nm_generic_mit, mit_timer);
@@ -865,7 +957,7 @@ generic_timer_handler(struct hrtimer *t)
 	mit->mit_pending = 0;
 	/* below is a variation of netmap_generic_irq  XXX revise */
 	if (nm_netmap_on(mit->mit_na)) {
-		netmap_common_irq(mit->mit_na->ifp, mit->mit_ring_idx, &work_done);
+		netmap_common_irq(mit->mit_na, mit->mit_ring_idx, &work_done);
 		generic_rate(0, 0, 0, 0, 0, 1);
 	}
 	nm_os_mitigation_restart(mit);
@@ -876,7 +968,7 @@ generic_timer_handler(struct hrtimer *t)
 void nm_os_mitigation_init(struct nm_generic_mit *mit, int idx,
 struct netmap_adapter *na)
 {
-	DbgPrint("unimplemented generic_timer_handler %p\n");
+	DbgPrint("unimplemented generic_timer_handler\n");
 	//KeInitializeDpc(&mit->mit_timer.deferred_proc, &generic_timer_handler, NULL);
 	//KeInitializeTimer(&mit->mit_timer.timer);
 	//hrtimer_init(&mit->mit_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -888,7 +980,7 @@ struct netmap_adapter *na)
 
 void nm_os_mitigation_start(struct nm_generic_mit *mit)
 {
-	DbgPrint("unimplemented generic_timer_handler %p\n");
+	DbgPrint("unimplemented generic_timer_handler\n");
 	//LARGE_INTEGER test;
 	//KeSetTimerEx(&mit->mit_timer.timer, test, 1000, &mit->mit_timer.deferred_proc);
 	//mit->mit_timer.active = TRUE;
@@ -898,13 +990,13 @@ void nm_os_mitigation_start(struct nm_generic_mit *mit)
 
 void nm_os_mitigation_restart(struct nm_generic_mit *mit)
 {
-	DbgPrint("unimplemented nm_os_mitigation_start %p\n");
+	DbgPrint("unimplemented nm_os_mitigation_start\n");
 	//hrtimer_forward_now(&mit->mit_timer, ktime_set(0, netmap_generic_mit));
 }
 
 int nm_os_mitigation_active(struct nm_generic_mit *mit)
 {
-	DbgPrint("unimplemented nm_os_mitigation_active %p\n");
+	DbgPrint("unimplemented nm_os_mitigation_active\n");
 	return 0;
 	//return mit->mit_timer.active;
 	//return hrtimer_active(&mit->mit_timer);
@@ -916,5 +1008,73 @@ void nm_os_mitigation_cleanup(struct nm_generic_mit *mit)
 	//mit->mit_timer.active = FALSE;
 	//KeCancelTimer(&mit->mit_timer.timer);
 	//hrtimer_cancel(&mit->mit_timer);
+}
+
+u_int
+nm_os_ncpus(void)
+{
+	return 1;  // TODO
+}
+
+int
+nm_os_mbuf_has_csum_offld(struct mbuf *m)
+{
+	return 0;  // TODO
+}
+
+int
+nm_os_mbuf_has_seg_offld(struct mbuf *m)
+{
+	return 0;  // TODO
+}
+
+void
+nm_os_get_module(void)
+{
+	// TODO
+}
+
+void
+nm_os_put_module(void)
+{
+	// TODO
+}
+
+
+struct nm_kctx {
+    int unused; /* To avoid compiler barfs */
+};
+
+void
+nm_os_kctx_worker_setaff(struct nm_kctx *nmk, int affinity)
+{
+	// TODO
+}
+
+struct nm_kctx *
+nm_os_kctx_create(struct nm_kctx_cfg *cfg, void *opaque)
+{
+	// TODO
+	return NULL;
+}
+
+int
+nm_os_kctx_worker_start(struct nm_kctx *nmk)
+{
+	// TODO
+	return -1;
+}
+
+void
+nm_os_kctx_worker_stop(struct nm_kctx *nmk)
+{
+	// TODO
+}
+
+
+void
+nm_os_kctx_destroy(struct nm_kctx *nmk)
+{
+	// TODO
 }
 

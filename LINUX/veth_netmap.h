@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 Vincenzo Maffione. All rights reserved.
+ * Copyright (C) 2014-2016 Vincenzo Maffione. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -27,187 +27,196 @@
 #include <bsd_glue.h>
 #include <net/netmap.h>
 #include <netmap/netmap_kern.h>
+#include <dev/netmap/netmap_mem2.h>
+
+#ifndef WITH_PIPES
+#error "netmap pipes are required by veth native adapter"
+#endif /* WITH_PIPES */
 
 static int veth_open(struct ifnet *ifp);
 static int veth_close(struct ifnet *ifp);
 
+struct netmap_veth_adapter {
+	struct netmap_hw_adapter up;
+	struct netmap_veth_adapter *peer;
+	int peer_ref;
+};
+
+/* To be called under RCU read lock. This also sets peer_ref in the
+ * same way netmap_get_pipe_na() does. */
+static struct netmap_adapter *
+veth_get_peer_na(struct netmap_adapter *na)
+{
+	struct ifnet *ifp = na->ifp;
+	struct veth_priv *priv = netdev_priv(ifp);
+	struct ifnet *peer_ifp;
+	struct netmap_veth_adapter *vna =
+		(struct netmap_veth_adapter *)na;
+
+	if (vna->peer == NULL) {
+		/* Only one of the two endpoint enters here,
+		 * and only once. */
+		peer_ifp = rcu_dereference(priv->peer);
+		if (!peer_ifp) {
+			return NULL;
+		}
+		/* Cross link the peer netmap adapters. Note that we
+		 * can retrieve the peer to do our clean-up even if
+		 * the peer_ifp is detached from us. */
+		vna->peer = (struct netmap_veth_adapter *)NA(peer_ifp);
+		vna->peer->peer = vna;
+
+		/* Get a reference to the other endpoint. */
+		netmap_adapter_get(&vna->peer->up.up);
+		vna->peer_ref = 1;
+	}
+
+	return &vna->peer->up.up;
+}
+
+static void
+veth_netmap_dtor(struct netmap_adapter *na)
+{
+	struct netmap_veth_adapter *vna =
+		(struct netmap_veth_adapter *)na;
+	if (vna->peer_ref) {
+		vna->peer_ref = 0;
+		vna->peer->peer = NULL;
+		netmap_adapter_put(&vna->peer->up.up);
+	}
+}
+
 /*
- * Register/unregister. We are already under netmap lock.
+ * Register/unregister. We are already under RCU lock.
+ * This register function is similar to the one used by
+ * pipes; in addition to the regular tasks (commit the rings
+ * in/out netmap node and call nm_(set|clear)_native_flags),
+ * we also mark the peer rings as needed by us and possibly
+ * create/destroy some netmap rings.
  */
 static int
 veth_netmap_reg(struct netmap_adapter *na, int onoff)
 {
+	struct netmap_veth_adapter *vna =
+		(struct netmap_veth_adapter *)na;
+	struct netmap_adapter *peer_na;
 	struct ifnet *ifp = na->ifp;
-	bool was_up = false;
+	bool was_up;
+	int error;
 
-	if (netif_running(ifp)) {
+	peer_na = veth_get_peer_na(na);
+	if (!peer_na) {
+		return EINVAL;
+	}
+
+	was_up = netif_running(ifp);
+	if (na->active_fds == 0 && was_up) {
 		/* The interface is up. Close it while (un)registering. */
-		was_up = true;
 		veth_close(ifp);
 	}
 
-	/* enable or disable flags and callbacks in na and ifp */
+	/* Enable or disable flags and callbacks in na and ifp. */
 	if (onoff) {
+		enum txrx t;
+
+		error = netmap_pipe_reg_both(na, peer_na);
+		if (error) {
+			return error;
+		}
+		for_rx_tx(t) {
+			int i;
+
+			for (i = nma_get_nrings(na, t);
+			    i < netmap_real_rings(na, t); i++) {
+				struct netmap_kring *kring = NMR(na, t)[i];
+
+				if (nm_kring_pending_on(kring)) {
+					/* mark the peer ring as needed */
+					kring->nr_mode |= NKR_NETMAP_ON	;
+				}
+			}
+		}
 		nm_set_native_flags(na);
+		if (netmap_verbose) {
+			nm_prinf("registered veth %s", na->name);
+		}
 	} else {
 		nm_clear_native_flags(na);
+		netmap_krings_mode_commit(na, onoff);
+		if (netmap_verbose) {
+			nm_prinf("unregistered veth %s", na->name);
+		}
 	}
 
-	if (was_up)
+	if (na->active_fds == 0 && was_up) {
 		veth_open(ifp);
-
-	return (0);
-}
-
-
-/*
- * Reconcile kernel and user view of the transmit ring.
- */
-static int
-veth_netmap_txsync(struct netmap_kring *kring, int flags)
-{
-	struct netmap_adapter *na = kring->na;
-	struct ifnet *ifp = na->ifp;
-	struct netmap_ring *ring = kring->ring;
-	u_int ring_nr = kring->ring_id;
-	u_int nm_i;	/* index into the netmap ring */
-	u_int n;
-	u_int const lim = kring->nkr_num_slots - 1;
-	u_int const head = kring->rhead;
-
-	/* device-specific */
-	struct veth_priv *priv = netdev_priv(ifp);
-	struct net_device *peer_ifp;
-	struct netmap_adapter *peer_na;
-	struct netmap_kring *peer_kring;
-	struct netmap_ring *peer_ring;
-	u_int nm_j;
-	u_int peer_hwtail_lim;
-	u_int lim_peer;
-
-	rcu_read_lock();
-
-	if (unlikely(!netif_carrier_ok(ifp)))
-		goto out;
-
-	peer_ifp = rcu_dereference(priv->peer);
-	if (unlikely(!peer_ifp))
-		goto out;
-
-	peer_na = NA(peer_ifp);
-	if (unlikely(!nm_netmap_on(peer_na)))
-		goto out;
-
-	peer_kring = &peer_na->rx_rings[ring_nr];
-	peer_ring = peer_kring->ring;
-	lim_peer = peer_kring->nkr_num_slots - 1;
-
-	/*
-	 * First part: process new packets to send.
-	 */
-	nm_i = kring->nr_hwcur;
-	nm_j = peer_kring->nr_hwtail;
-	mb();  /* for reading peer_kring->nr_hwcur */
-	peer_hwtail_lim = nm_prev(peer_kring->nr_hwcur, lim_peer);
-	if (nm_i != head) {	/* we have new packets to send */
-		for (n = 0; nm_i != head && nm_j != peer_hwtail_lim; n++) {
-			struct netmap_slot *slot = &ring->slot[nm_i];
-			u_int len = slot->len;
-			struct netmap_slot tmp;
-			void *addr = NMB(na, slot);
-
-			/* device specific */
-			struct netmap_slot *peer_slot = &peer_ring->slot[nm_j];
-
-			NM_CHECK_ADDR_LEN(na, addr, len);
-
-			tmp = *slot;
-			*slot = *peer_slot;
-			*peer_slot = tmp;
-
-			nm_i = nm_next(nm_i, lim);
-			nm_j = nm_next(nm_j, lim_peer);
-		}
-		kring->nr_hwcur = nm_i;
-
-		mb();  /* for writing the slots */
-
-		peer_kring->nr_hwtail = nm_j;
-		if (peer_kring->nr_hwtail > lim_peer) {
-			peer_kring->nr_hwtail -= lim_peer + 1;
-		}
-
-		mb();  /* for writing peer_kring->nr_hwtail */
-
-		/*
-		 * Second part: reclaim buffers for completed transmissions.
-		 */
-		kring->nr_hwtail += n;
-		if (kring->nr_hwtail > lim)
-			kring->nr_hwtail -= lim + 1;
-
-		peer_kring->nm_notify(peer_kring, 0);
 	}
-out:
-	rcu_read_unlock();
+
+	if (vna->peer_ref) {
+		return 0;
+	}
+	if (onoff) {
+		vna->peer->peer_ref = 0;
+		netmap_adapter_put(na);
+	} else {
+		netmap_adapter_get(na);
+		vna->peer->peer_ref = 1;
+	}
 
 	return 0;
 }
 
-
-/*
- * Reconcile kernel and user view of the receive ring.
- */
 static int
-veth_netmap_rxsync(struct netmap_kring *kring, int flags)
+veth_netmap_krings_create(struct netmap_adapter *na)
 {
-	struct netmap_adapter *na = kring->na;
-	struct ifnet *ifp = na->ifp;
-	u_int ring_nr = kring->ring_id;
-	u_int const head = kring->rhead;
-	struct netmap_kring *peer_kring;
-
-	/* device-specific */
-	struct veth_priv *priv = netdev_priv(ifp);
-	struct net_device *peer_ifp;
+	struct netmap_veth_adapter *vna = (struct netmap_veth_adapter *)na;
 	struct netmap_adapter *peer_na;
-	uint32_t oldhwcur = kring->nr_hwcur;
 
+	/* The nm_krings_create callback is called first in netmap_do_regif(),
+	 * so the the cross linking happens now (if this is the first endpoint
+	 * to register). */
 	rcu_read_lock();
-
-	if (unlikely(!netif_carrier_ok(ifp)))
-		goto out;
-
-	peer_ifp = rcu_dereference(priv->peer);
-	if (unlikely(!peer_ifp))
-		goto out;
-
-	peer_na = NA(peer_ifp);
-	if (unlikely(!nm_netmap_on(peer_na)))
-		goto out;
-
-
-	mb();
-
-	/*
-	 * First part: import newly received packets.
-	 * This is done by the peer's txsync.
-	 */
-
-	/*
-	 * Second part: skip past packets that userspace has released.
-	 */
-	kring->nr_hwcur = head;
-
-	if (oldhwcur != head) {
-		mb();  /* for writing kring->nr_hwcur */
-		peer_kring = &peer_na->tx_rings[ring_nr];
-		peer_kring->nm_notify(peer_kring, 0);
-	}
-out:
+	peer_na = veth_get_peer_na(na);
 	rcu_read_unlock();
+	if (!peer_na) {
+		nm_prerr("veth peer not found for %s", na->name);
+		return ENXIO;
+	}
+
+	if (vna->peer_ref)
+		return netmap_pipe_krings_create_both(na, peer_na);
 
 	return 0;
+}
+
+static void
+veth_netmap_krings_delete(struct netmap_adapter *na)
+{
+	struct netmap_veth_adapter *vna = (struct netmap_veth_adapter *)na;
+	struct netmap_adapter *peer_na;
+
+	if (!vna->peer_ref) {
+		return;
+	}
+
+	if (netmap_verbose) {
+		nm_prinf("Delete krings for %s and its peer", na->name);
+	}
+
+	rcu_read_lock();
+	peer_na = veth_get_peer_na(na);
+	rcu_read_unlock();
+	if (!peer_na) {
+		nm_prinf("veth peer not found");
+		return;
+	}
+
+	netmap_pipe_krings_delete_both(na, peer_na);
+
+	netmap_adapter_put(&vna->peer->up.up);
+	vna->peer_ref = 0;
+	vna->peer->peer = NULL;
+	vna->peer = NULL;
 }
 
 static void
@@ -222,10 +231,14 @@ veth_netmap_attach(struct ifnet *ifp)
 	na.num_tx_desc = 1024;
 	na.num_rx_desc = 1024;
 	na.nm_register = veth_netmap_reg;
-	na.nm_txsync = veth_netmap_txsync;
-	na.nm_rxsync = veth_netmap_rxsync;
+	na.nm_txsync = netmap_pipe_txsync;
+	na.nm_rxsync = netmap_pipe_rxsync;
+	na.nm_krings_create = veth_netmap_krings_create;
+	na.nm_krings_delete = veth_netmap_krings_delete;
+	na.nm_dtor = veth_netmap_dtor;
 	na.num_tx_rings = na.num_rx_rings = 1;
-	netmap_attach(&na);
+	netmap_attach_ext(&na, sizeof(struct netmap_veth_adapter),
+			0 /* do not override reg */);
 }
 
 /* end of file */
